@@ -29,6 +29,33 @@ if [[ -n "$INPUT" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Skip subagent Stop events — only the parent autopilot session drives the loop
+# ---------------------------------------------------------------------------
+# Stop hooks fire on every Stop event in the Claude Code process, including
+# subagent (Task tool / TeamCreate) stops. Subagent transcripts often include
+# the literal "<promise>" string (it's documented in skill files Read by agents),
+# which would falsely trip the promise-scan below and end the session early.
+IS_SUBAGENT=""
+if [[ -n "$INPUT" ]] && _has_jq; then
+  IS_SUBAGENT="$(echo "$INPUT" | jq -r '
+    if .parent_session_id != null then "1"
+    elif .agent_id != null then "1"
+    elif .subagent_id != null then "1"
+    elif (.transcript_path // "") | test("/subagents/") then "1"
+    else ""
+    end' 2>/dev/null || true)"
+fi
+if [[ -z "$IS_SUBAGENT" && -n "$TRANSCRIPT_PATH" ]]; then
+  # Fallback: path-based check even without jq fields
+  case "$TRANSCRIPT_PATH" in
+    */subagents/*) IS_SUBAGENT="1" ;;
+  esac
+fi
+if [[ -n "$IS_SUBAGENT" ]]; then
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Check for active session
 # ---------------------------------------------------------------------------
 SESSION_ID="$(get_active_session_id)"
@@ -97,12 +124,25 @@ if (( TOTAL_FIX_ATTEMPTS >= MAX_TOTAL_FIXES )); then
 fi
 
 # ---------------------------------------------------------------------------
-# Promise tag scanning
+# Promise tag scanning — only honored from REVIEW phase (DONE is a legitimate
+# transition only from REVIEW). Restrict to the latest assistant text to avoid
+# matching skill-file Reads that happen to quote "<promise>".
 # ---------------------------------------------------------------------------
-if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-  # Look for <promise> tag indicating completion
-  if grep -q '<promise>' "$TRANSCRIPT_PATH" 2>/dev/null; then
-    echo "[autopilot] Promise tag found in transcript. Marking DONE." >&2
+if [[ "$PHASE" == "REVIEW" && -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
+  PROMISE_HIT=""
+  if _has_jq; then
+    PROMISE_HIT="$(tac "$TRANSCRIPT_PATH" 2>/dev/null | jq -rs '
+      map(select(.type == "assistant"
+                 and ((.isSidechain // false) == false)
+                 and ((.message.content // []) | map(select(.type == "text")) | length > 0)))
+      | (.[0].message.content // [])
+      | map(select(.type == "text"))
+      | (.[0].text // "")
+      | select(test("<promise>"))
+      | "1"' 2>/dev/null || true)"
+  fi
+  if [[ -n "$PROMISE_HIT" ]]; then
+    echo "[autopilot] Promise tag found in REVIEW transcript. Marking DONE." >&2
     set_phase "DONE" "$SESSION_ID"
     update_session_status "$SESSION_ID" "completed" "DONE" 2>/dev/null || true
     exit 0
